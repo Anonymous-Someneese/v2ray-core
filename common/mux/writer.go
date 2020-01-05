@@ -124,3 +124,58 @@ func (w *Writer) Close() error {
 	w.writer.WriteMultiBuffer(buf.MultiBuffer{frame}) // nolint: errcheck
 	return nil
 }
+
+// AtomicWriter is a buf.Writer that is thread-safe
+type AtomicWriter struct {
+	w  buf.Writer
+	ch chan atomicWriterMsg
+}
+
+type atomicWriterMsg struct {
+	mb  buf.MultiBuffer
+	err chan error
+}
+
+// NewAtomicWriter creates an AtomicWriter
+func NewAtomicWriter(w buf.Writer) *AtomicWriter {
+	aw := &AtomicWriter{
+		w:  w,
+		ch: make(chan atomicWriterMsg),
+	}
+	go aw.run()
+	return aw
+}
+
+func (w *AtomicWriter) run() {
+	for {
+		msg, ok := <- w.ch
+		if !ok {
+			common.Close(w.w)
+			return
+		}
+		msg.err <- w.w.WriteMultiBuffer(msg.mb)
+	}
+}
+
+// WriteMultiBuffer implements buf.Writer.
+func (w *AtomicWriter) WriteMultiBuffer(mb buf.MultiBuffer) (err error) {
+	defer func() {
+		if e := recover(); e != nil {
+			err = newError("channel closed").Base(e.(error))
+		}
+	}()
+	msg := atomicWriterMsg {
+		mb:  mb,
+		err: make(chan error),
+	}
+	w.ch <- msg
+	err = <- msg.err
+	close(msg.err)
+	return err
+}
+
+// Close implements common.Closable.
+func (w *AtomicWriter) Close() error {
+	close(w.ch)
+	return common.Close(w.w)
+}

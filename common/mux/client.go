@@ -184,9 +184,13 @@ var muxCoolPort = net.Port(9527)
 
 // NewClientWorker creates a new mux.Client.
 func NewClientWorker(stream transport.Link, s ClientStrategy) (*ClientWorker, error) {
+	aw := NewAtomicWriter(stream.Writer)
 	c := &ClientWorker{
 		sessionManager: NewSessionManager(),
-		link:           stream,
+		link:           transport.Link{
+			Reader: stream.Reader,
+			Writer: aw,
+		},
 		done:           done.New(),
 		strategy:       s,
 	}
@@ -247,7 +251,8 @@ func (m *ClientWorker) newSession() *Session {
 func (m *ClientWorker) closeSession(s *Session) error {
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
-	err := m.closeSession(s)
+	err := s.Close()
+	newError("session ", s.ID, " ends.").Base(err).WriteToLog()
 	if err != nil {
 		return err
 	}
