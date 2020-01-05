@@ -145,7 +145,7 @@ func (p *StaticMuxPicker) PickAvailable() (*mux.ClientWorker, error) {
 	var minIdx int = -1
 	var minConn uint32 = 9999
 	for i, w := range p.workers {
-		if w.draining {
+		if w.draining || w.IsFull() || w.Closed() {
 			continue
 		}
 		if w.client.ActiveConnections() < minConn {
@@ -156,7 +156,7 @@ func (p *StaticMuxPicker) PickAvailable() (*mux.ClientWorker, error) {
 
 	if minIdx == -1 {
 		for i, w := range p.workers {
-			if w.IsFull() {
+			if w.IsFull() || w.Closed() {
 				continue
 			}
 			if w.client.ActiveConnections() < minConn {
