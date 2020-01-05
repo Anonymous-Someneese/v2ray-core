@@ -187,6 +187,7 @@ func (p *StaticMuxPicker) NewWorker(link *transport.Link) error {
 	cs := mux.ClientStrategy{IdleTimeout: 300 * time.Second}
 	if len(p.workers) == 0 {
 		cs.IdleTimeout = 0
+		cs.SendHeartbeat = true
 	}
 	muxClient, err := mux.NewClientWorker(*link, cs)
 	if err != nil {
