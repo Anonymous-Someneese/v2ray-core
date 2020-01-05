@@ -70,18 +70,7 @@ func (p *Portal) HandleConnection(ctx context.Context, link *transport.Link) err
 	}
 
 	if isDomain(outboundMeta.Target, p.domain) {
-		muxClient, err := mux.NewClientWorker(*link, mux.ClientStrategy{})
-		if err != nil {
-			return newError("failed to create mux client worker").Base(err).AtWarning()
-		}
-
-		worker, err := NewPortalWorker(muxClient)
-		if err != nil {
-			return newError("failed to create portal worker").Base(err)
-		}
-
-		p.picker.AddWorker(worker)
-		return nil
+		return p.picker.NewWorker(link)
 	}
 
 	return p.client.Dispatch(ctx, link)
@@ -189,6 +178,28 @@ func (p *StaticMuxPicker) AddWorker(worker *PortalWorker) {
 	defer p.access.Unlock()
 
 	p.workers = append(p.workers, worker)
+}
+
+func (p *StaticMuxPicker) NewWorker(link *transport.Link) error {
+	p.cleanup()
+	p.access.Lock()
+	defer p.access.Unlock()
+	cs := mux.ClientStrategy{IdleTimeout: 300 * time.Second}
+	if len(p.workers) == 0 {
+		cs.IdleTimeout = 0
+	}
+	muxClient, err := mux.NewClientWorker(*link, cs)
+	if err != nil {
+		return newError("failed to create mux client worker").Base(err).AtWarning()
+	}
+
+	worker, err := NewPortalWorker(muxClient)
+	if err != nil {
+		return newError("failed to create portal worker").Base(err)
+	}
+
+	p.workers = append(p.workers, worker)
+	return nil
 }
 
 type PortalWorker struct {

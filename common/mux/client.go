@@ -166,6 +166,7 @@ func (f *DialingWorkerFactory) Create() (*ClientWorker, error) {
 type ClientStrategy struct {
 	MaxConcurrency uint32
 	MaxConnection  uint32
+	IdleTimeout    time.Duration
 }
 
 type ClientWorker struct {
@@ -173,6 +174,8 @@ type ClientWorker struct {
 	link           transport.Link
 	done           *done.Instance
 	strategy       ClientStrategy
+	idleTimer      *time.Timer
+	mutex          sync.Mutex
 }
 
 var muxCoolAddress = net.DomainAddress("v1.mux.cool")
@@ -209,6 +212,9 @@ func (m *ClientWorker) Closed() bool {
 func (m *ClientWorker) monitor() {
 	timer := time.NewTicker(time.Second * 16)
 	defer timer.Stop()
+	keepalive := buf.StackNew()
+	defer keepalive.Release()
+	common.Must(FrameMetadata{SessionStatus: SessionStatusKeepAlive}.WriteTo(&keepalive))
 
 	for {
 		select {
@@ -218,12 +224,39 @@ func (m *ClientWorker) monitor() {
 			common.Interrupt(m.link.Reader) // nolint: errcheck
 			return
 		case <-timer.C:
-			size := m.sessionManager.Size()
-			if size == 0 && m.sessionManager.CloseIfNoSession() {
-				common.Must(m.done.Close())
-			}
+			m.link.Writer.WriteMultiBuffer(buf.MultiBuffer{&keepalive})
 		}
 	}
+}
+
+func (m *ClientWorker) newSession() *Session {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+	s := m.sessionManager.Allocate()
+	if s == nil {
+		return s
+	}
+	if m.idleTimer != nil && m.sessionManager.Size() > 0 {
+		m.idleTimer.Stop()
+		m.idleTimer = nil
+	}
+	return s
+}
+
+func (m *ClientWorker) closeSession(s *Session) error {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+	err := m.closeSession(s)
+	if err != nil {
+		return err
+	}
+	if m.strategy.IdleTimeout > 0 && m.sessionManager.Size() == 0 {
+		m.idleTimer = time.AfterFunc(m.strategy.IdleTimeout, func() {
+			common.Must(m.done.Close())
+			m.idleTimer = nil
+		})
+	}
+	return nil
 }
 
 func writeFirstPayload(reader buf.Reader, writer *Writer) error {
@@ -239,7 +272,7 @@ func writeFirstPayload(reader buf.Reader, writer *Writer) error {
 	return nil
 }
 
-func fetchInput(ctx context.Context, s *Session, output buf.Writer) {
+func (m *ClientWorker) fetchInput(ctx context.Context, s *Session, output buf.Writer) {
 	dest := session.OutboundFromContext(ctx).Target
 	transferType := protocol.TransferTypeStream
 	if dest.Network == net.Network_UDP {
@@ -247,7 +280,7 @@ func fetchInput(ctx context.Context, s *Session, output buf.Writer) {
 	}
 	s.transferType = transferType
 	writer := NewWriter(s.ID, dest, output, transferType)
-	defer s.Close()      // nolint: errcheck
+	defer m.closeSession(s)      // nolint: errcheck
 	defer writer.Close() // nolint: errcheck
 
 	newError("dispatching request to ", dest).WriteToLog(session.ExportIDToError(ctx))
@@ -291,14 +324,10 @@ func (m *ClientWorker) Dispatch(ctx context.Context, link *transport.Link) bool 
 		return false
 	}
 
-	sm := m.sessionManager
-	s := sm.Allocate()
-	if s == nil {
-		return false
-	}
+	s := m.newSession()
 	s.input = link.Reader
 	s.output = link.Writer
-	go fetchInput(ctx, s, m.link.Writer)
+	go m.fetchInput(ctx, s, m.link.Writer)
 	return true
 }
 
@@ -341,7 +370,7 @@ func (m *ClientWorker) handleStatusKeep(meta *FrameMetadata, reader *buf.Buffere
 
 		drainErr := buf.Copy(rr, buf.Discard)
 		common.Interrupt(s.input)
-		s.Close()
+		m.closeSession(s)
 		return drainErr
 	}
 
@@ -354,7 +383,7 @@ func (m *ClientWorker) handleStatusEnd(meta *FrameMetadata, reader *buf.Buffered
 			common.Interrupt(s.input)
 			common.Interrupt(s.output)
 		}
-		s.Close()
+		m.closeSession(s)
 	}
 	if meta.Option.Has(OptionData) {
 		return buf.Copy(NewStreamReader(reader), buf.Discard)
