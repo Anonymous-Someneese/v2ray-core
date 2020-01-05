@@ -116,6 +116,7 @@ func NewHandler(ctx context.Context, config *core.OutboundHandlerConfig) (outbou
 						MaxConcurrency: config.Concurrency,
 						MaxConnection:  128,
 						IdleTimeout:    300 * time.Second,
+						SendHeartbeat:  true,
 					},
 				},
 			},
