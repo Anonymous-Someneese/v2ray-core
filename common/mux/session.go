@@ -18,7 +18,7 @@ type SessionManager struct {
 func NewSessionManager() *SessionManager {
 	return &SessionManager{
 		count:    0,
-		sessions: make(map[uint16]*Session, 16),
+		sessions: make(map[uint16]*Session),
 	}
 }
 
@@ -81,10 +81,6 @@ func (m *SessionManager) Remove(id uint16) {
 	}
 
 	delete(m.sessions, id)
-
-	if len(m.sessions) == 0 {
-		m.sessions = make(map[uint16]*Session, 16)
-	}
 }
 
 func (m *SessionManager) Get(id uint16) (*Session, bool) {
