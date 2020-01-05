@@ -166,6 +166,7 @@ func (f *DialingWorkerFactory) Create() (*ClientWorker, error) {
 type ClientStrategy struct {
 	MaxConcurrency uint32
 	MaxConnection  uint32
+	SendHeartbeat  bool
 	IdleTimeout    time.Duration
 }
 
