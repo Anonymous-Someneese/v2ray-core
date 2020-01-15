@@ -4,27 +4,27 @@ package reverse
 
 import (
 	"context"
+	"io"
 	"sync"
 	"time"
 
-	"github.com/golang/protobuf/proto"
 	"v2ray.com/core/common"
 	"v2ray.com/core/common/buf"
+	"v2ray.com/core/common/errors"
+	"v2ray.com/core/common/log"
 	"v2ray.com/core/common/mux"
 	"v2ray.com/core/common/net"
 	"v2ray.com/core/common/session"
 	"v2ray.com/core/common/task"
 	"v2ray.com/core/features/outbound"
 	"v2ray.com/core/transport"
-	"v2ray.com/core/transport/pipe"
 )
 
 type Portal struct {
-	ohm    outbound.Manager
-	tag    string
-	domain string
-	picker *StaticMuxPicker
-	client *mux.ClientManager
+	ohm     outbound.Manager
+	tag     string
+	domain  string
+	control control
 }
 
 func NewPortal(config *PortalConfig, ohm outbound.Manager) (*Portal, error) {
@@ -36,19 +36,10 @@ func NewPortal(config *PortalConfig, ohm outbound.Manager) (*Portal, error) {
 		return nil, newError("portal domain is empty")
 	}
 
-	picker, err := NewStaticMuxPicker()
-	if err != nil {
-		return nil, err
-	}
-
 	return &Portal{
 		ohm:    ohm,
 		tag:    config.Tag,
 		domain: config.Domain,
-		picker: picker,
-		client: &mux.ClientManager{
-			Picker: picker,
-		},
 	}, nil
 }
 
@@ -70,21 +61,16 @@ func (p *Portal) HandleConnection(ctx context.Context, link *transport.Link) err
 	}
 
 	if isDomain(outboundMeta.Target, p.domain) {
-		muxClient, err := mux.NewClientWorker(*link, mux.ClientStrategy{})
-		if err != nil {
-			return newError("failed to create mux client worker").Base(err).AtWarning()
+		// control connection
+		if outboundMeta.Target.Port == net.Port(1) {
+			p.control.link = link
+			return p.control.run(ctx)
 		}
-
-		worker, err := NewPortalWorker(muxClient)
-		if err != nil {
-			return newError("failed to create portal worker").Base(err)
-		}
-
-		p.picker.AddWorker(worker)
-		return nil
+		// data connection
+		return p.control.handleDataConn(ctx, link, outboundMeta.Target.Port.Value())
 	}
-
-	return p.client.Dispatch(ctx, link)
+	// new request via control
+	return p.control.Dispatch(ctx, link)
 }
 
 type Outbound struct {
@@ -111,156 +97,142 @@ func (o *Outbound) Close() error {
 	return nil
 }
 
-type StaticMuxPicker struct {
-	access  sync.Mutex
-	workers []*PortalWorker
-	cTask   *task.Periodic
+type control struct {
+	link    *transport.Link
+	pending [65535]*transport.Link
+	mutex   sync.RWMutex
 }
 
-func NewStaticMuxPicker() (*StaticMuxPicker, error) {
-	p := &StaticMuxPicker{}
-	p.cTask = &task.Periodic{
-		Execute:  p.cleanup,
-		Interval: time.Second * 30,
-	}
-	p.cTask.Start()
-	return p, nil
-}
-
-func (p *StaticMuxPicker) cleanup() error {
-	p.access.Lock()
-	defer p.access.Unlock()
-
-	var activeWorkers []*PortalWorker
-	for _, w := range p.workers {
-		if !w.Closed() {
-			activeWorkers = append(activeWorkers, w)
+func (c *control) Dispatch(ctx context.Context, link *transport.Link) error {
+	dest := session.OutboundFromContext(ctx).Target
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	id := uint16(2)
+	// find available id
+	for ; id < uint16(65535); id++ {
+		if c.pending[id] == nil {
+			break
 		}
 	}
-
-	if len(activeWorkers) != len(p.workers) {
-		p.workers = activeWorkers
+	// Initialize connection via Control link
+	b := buf.New()
+	meta := mux.FrameMetadata{
+		SessionStatus: mux.SessionStatusNew,
+		SessionID:     id,
+		Target:        dest,
 	}
-
+	if err := meta.WriteTo(b); err != nil {
+		return err
+	}
+	err := c.link.Writer.WriteMultiBuffer(buf.MultiBuffer{b})
+	if err != nil {
+		return err
+	}
+	c.pending[id] = link
 	return nil
 }
 
-func (p *StaticMuxPicker) PickAvailable() (*mux.ClientWorker, error) {
-	p.access.Lock()
-	defer p.access.Unlock()
-
-	if len(p.workers) == 0 {
-		return nil, newError("empty worker list")
+func (c *control) handleDataConn(ctx context.Context, bridgeLink *transport.Link, sessionID uint16) error {
+	// Take pending connection out
+	c.mutex.Lock()
+	link := c.pending[sessionID]
+	c.pending[sessionID] = nil
+	c.mutex.Unlock()
+	if link == nil {
+		return newError("cannot find corresponding sessionID")
 	}
-
-	var minIdx int = -1
-	var minConn uint32 = 9999
-	for i, w := range p.workers {
-		if w.draining {
-			continue
-		}
-		if w.client.ActiveConnections() < minConn {
-			minConn = w.client.ActiveConnections()
-			minIdx = i
-		}
+	// Copy
+	b2cFunc := func() error {
+		return buf.Copy(bridgeLink.Reader, link.Writer)
 	}
+	c2bFunc := func() error {
+		return buf.Copy(link.Reader, bridgeLink.Writer)
+	}
+	b2cDonePost := task.OnSuccess(b2cFunc, task.Close(link.Writer))
+	c2bDonePost := task.OnSuccess(c2bFunc, task.Close(bridgeLink.Writer))
+	err := task.Run(ctx, b2cDonePost, c2bDonePost)
+	if err != nil {
+		common.Interrupt(link.Writer)
+		common.Interrupt(bridgeLink.Writer)
+		return newError("connection closed").Base(err)
+	}
+	return nil
+}
 
-	if minIdx == -1 {
-		for i, w := range p.workers {
-			if w.IsFull() {
-				continue
+func (c *control) run(ctx context.Context) error {
+	timer := time.NewTicker(15 * time.Second)
+	defer timer.Stop()
+	keepalive := buf.StackNew()
+	defer keepalive.Release()
+	meta := mux.FrameMetadata{SessionStatus: mux.SessionStatusKeepAlive}
+	common.Must(meta.WriteTo(&keepalive))
+
+	reader := &buf.BufferedReader{Reader: c.link.Reader}
+	var err error
+	for {
+		select {
+		case <-ctx.Done():
+			return context.Canceled
+		case <- timer.C:
+			err = c.link.Writer.WriteMultiBuffer(buf.MultiBuffer{&keepalive})
+			break
+		default:
+			err = c.handleFrame(ctx, reader)
+			if err != nil && errors.GetSeverity(err) >= log.Severity_Info {
+				newError("handle frame error").Base(err).WriteToLog(session.ExportIDToError(ctx))
+				err = nil
 			}
-			if w.client.ActiveConnections() < minConn {
-				minConn = w.client.ActiveConnections()
-				minIdx = i
+			break
+		}
+		if err != nil {
+			if errors.Cause(err) == io.EOF {
+				return err
 			}
+			common.Close(c.link.Writer)
+			common.Interrupt(c.link.Reader)
+			return newError("unexpected EOF").Base(err)
 		}
 	}
-
-	if minIdx != -1 {
-		return p.workers[minIdx].client, nil
-	}
-
-	return nil, newError("no mux client worker available")
 }
 
-func (p *StaticMuxPicker) AddWorker(worker *PortalWorker) {
-	p.access.Lock()
-	defer p.access.Unlock()
+func (c *control) handleFrame(ctx context.Context, r *buf.BufferedReader) error {
+	var meta mux.FrameMetadata
+	err := meta.Unmarshal(r)
+	if err != nil {
+		return newError("failed to read metadata").Base(err).AtWarning()
+	}
 
-	p.workers = append(p.workers, worker)
+	switch meta.SessionStatus {
+	case mux.SessionStatusKeepAlive:
+		err = c.handleStatusKeepAlive(&meta, r)
+	case mux.SessionStatusEnd:
+		err = c.handleStatusEnd(&meta, r)
+	default:
+		status := meta.SessionStatus
+		return newError("unknown status: ", status).AtError()
+	}
+	if err != nil {
+		return newError("failed to process data").Base(err)
+	}
+	return nil
 }
 
-type PortalWorker struct {
-	client   *mux.ClientWorker
-	control  *task.Periodic
-	writer   buf.Writer
-	reader   buf.Reader
-	draining bool
+func (c *control) handleStatusKeepAlive(meta *mux.FrameMetadata, r *buf.BufferedReader) error {
+	if meta.Option.Has(mux.OptionData) {
+		return buf.Copy(mux.NewStreamReader(r), buf.Discard)
+	}
+	return nil
 }
 
-func NewPortalWorker(client *mux.ClientWorker) (*PortalWorker, error) {
-	opt := []pipe.Option{pipe.WithSizeLimit(16 * 1024)}
-	uplinkReader, uplinkWriter := pipe.New(opt...)
-	downlinkReader, downlinkWriter := pipe.New(opt...)
-
-	ctx := context.Background()
-	ctx = session.ContextWithOutbound(ctx, &session.Outbound{
-		Target: net.UDPDestination(net.DomainAddress(internalDomain), 0),
-	})
-	f := client.Dispatch(ctx, &transport.Link{
-		Reader: uplinkReader,
-		Writer: downlinkWriter,
-	})
-	if !f {
-		return nil, newError("unable to dispatch control connection")
+func (c *control) handleStatusEnd(meta *mux.FrameMetadata, r *buf.BufferedReader) error {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	if link := c.pending[meta.SessionID]; link != nil {
+		common.Interrupt(link.Writer)
+		common.Close(link.Reader)
 	}
-	w := &PortalWorker{
-		client: client,
-		reader: downlinkReader,
-		writer: uplinkWriter,
+	if meta.Option.Has(mux.OptionData) {
+		return buf.Copy(mux.NewStreamReader(r), buf.Discard)
 	}
-	w.control = &task.Periodic{
-		Execute:  w.heartbeat,
-		Interval: time.Second * 2,
-	}
-	w.control.Start()
-	return w, nil
-}
-
-func (w *PortalWorker) heartbeat() error {
-	if w.client.Closed() {
-		return newError("client worker stopped")
-	}
-
-	if w.draining || w.writer == nil {
-		return newError("already disposed")
-	}
-
-	msg := &Control{}
-	msg.FillInRandom()
-
-	if w.client.TotalConnections() > 256 {
-		w.draining = true
-		msg.State = Control_DRAIN
-
-		defer func() {
-			common.Close(w.writer)
-			common.Interrupt(w.reader)
-			w.writer = nil
-		}()
-	}
-
-	b, err := proto.Marshal(msg)
-	common.Must(err)
-	mb := buf.MergeBytes(nil, b)
-	return w.writer.WriteMultiBuffer(mb)
-}
-
-func (w *PortalWorker) IsFull() bool {
-	return w.client.IsFull()
-}
-
-func (w *PortalWorker) Closed() bool {
-	return w.client.Closed()
+	return nil
 }
