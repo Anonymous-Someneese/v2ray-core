@@ -14,6 +14,7 @@ import (
 	"v2ray.com/core/common/log"
 	"v2ray.com/core/common/mux"
 	"v2ray.com/core/common/net"
+	"v2ray.com/core/common/protocol"
 	"v2ray.com/core/common/session"
 	"v2ray.com/core/common/task"
 	"v2ray.com/core/features/outbound"
@@ -97,62 +98,64 @@ func (o *Outbound) Close() error {
 	return nil
 }
 
+type pendingLink struct {
+	reader buf.Reader
+	writer buf.Writer
+}
+
 type control struct {
 	link    *transport.Link
-	pending [65535]*transport.Link
+	pending [65535]*pendingLink
 	mutex   sync.RWMutex
 }
 
 func (c *control) Dispatch(ctx context.Context, link *transport.Link) error {
 	dest := session.OutboundFromContext(ctx).Target
-	c.mutex.Lock()
-	defer c.mutex.Unlock()
-	id := uint16(2)
-	// find available id
-	for ; id < uint16(65535); id++ {
-		if c.pending[id] == nil {
-			break
-		}
+	transferType := protocol.TransferTypeStream
+	if dest.Network == net.Network_UDP {
+		transferType = protocol.TransferTypePacket
 	}
-	// Initialize connection via Control link
-	b := buf.New()
-	meta := mux.FrameMetadata{
-		SessionStatus: mux.SessionStatusNew,
-		SessionID:     id,
-		Target:        dest,
-	}
-	if err := meta.WriteTo(b); err != nil {
-		return err
-	}
-	err := c.link.Writer.WriteMultiBuffer(buf.MultiBuffer{b})
+	reader := &buf.BufferedReader{Reader: link.Reader}
+	id, err := c.addPending(&pendingLink {
+		reader: reader,
+		writer: link.Writer,
+	})
 	if err != nil {
 		return err
 	}
-	c.pending[id] = link
+	// Initialize connection via Control link
+	w := mux.NewWriter(id, dest, c.link.Writer, transferType)
+	// Read Initial data
+	mb, err := reader.ReadAtMost(8*1024)
+	if err != nil {
+		c.replacePending(id, nil)
+		return err
+	}
+	if err := w.WriteMultiBuffer(mb); err != nil {
+		c.replacePending(id, nil)
+		return err
+	}
 	return nil
 }
 
 func (c *control) handleDataConn(ctx context.Context, bridgeLink *transport.Link, sessionID uint16) error {
 	// Take pending connection out
-	c.mutex.Lock()
-	link := c.pending[sessionID]
-	c.pending[sessionID] = nil
-	c.mutex.Unlock()
+	link := c.replacePending(sessionID, nil)
 	if link == nil {
 		return newError("cannot find corresponding sessionID")
 	}
 	// Copy
 	b2cFunc := func() error {
-		return buf.Copy(bridgeLink.Reader, link.Writer)
+		return buf.Copy(bridgeLink.Reader, link.writer)
 	}
 	c2bFunc := func() error {
-		return buf.Copy(link.Reader, bridgeLink.Writer)
+		return buf.Copy(link.reader, bridgeLink.Writer)
 	}
-	b2cDonePost := task.OnSuccess(b2cFunc, task.Close(link.Writer))
+	b2cDonePost := task.OnSuccess(b2cFunc, task.Close(link.writer))
 	c2bDonePost := task.OnSuccess(c2bFunc, task.Close(bridgeLink.Writer))
 	err := task.Run(ctx, b2cDonePost, c2bDonePost)
 	if err != nil {
-		common.Interrupt(link.Writer)
+		common.Interrupt(link.writer)
 		common.Interrupt(bridgeLink.Writer)
 		return newError("connection closed").Base(err)
 	}
@@ -173,7 +176,7 @@ func (c *control) run(ctx context.Context) error {
 		select {
 		case <-ctx.Done():
 			return context.Canceled
-		case <- timer.C:
+		case <-timer.C:
 			err = c.link.Writer.WriteMultiBuffer(buf.MultiBuffer{&keepalive})
 			break
 		default:
@@ -228,11 +231,37 @@ func (c *control) handleStatusEnd(meta *mux.FrameMetadata, r *buf.BufferedReader
 	c.mutex.Lock()
 	defer c.mutex.Unlock()
 	if link := c.pending[meta.SessionID]; link != nil {
-		common.Interrupt(link.Writer)
-		common.Close(link.Reader)
+		common.Interrupt(link.writer)
+		common.Close(link.reader)
 	}
 	if meta.Option.Has(mux.OptionData) {
 		return buf.Copy(mux.NewStreamReader(r), buf.Discard)
 	}
 	return nil
+}
+
+func (c *control) getPending(id uint16) *pendingLink {
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
+	return c.pending[id]
+}
+
+func (c *control) addPending(l *pendingLink) (uint16, error) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	for i := uint16(2); i < uint16(65535); i ++ {
+		if c.pending[i] == nil {
+			c.pending[i] = l
+			return i, nil
+		}
+	}
+	return 0, newError("pending link overflow")
+}
+
+func (c *control) replacePending(id uint16, l *pendingLink) *pendingLink {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	tmp := c.pending[id]
+	c.pending[id] = l
+	return tmp
 }
