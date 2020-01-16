@@ -91,6 +91,8 @@ func (b *Bridge) handleLink(ctx context.Context, link *transport.Link) error {
 	for {
 		select {
 		case <-ctx.Done():
+			common.Close(link.Writer)
+			common.Close(reader)
 			return context.Canceled
 		case <- timer.C:
 			err = link.Writer.WriteMultiBuffer(buf.MultiBuffer{&keepalive})
@@ -155,7 +157,41 @@ func (b *Bridge) handleStatusNew(ctx context.Context, meta *mux.FrameMetadata, r
 		msg.Email = inbound.User.Email
 	}
 	ctxmsg := log.ContextWithAccessMessage(ctx, msg)
+	
+	if meta.Target.Network == net.Network_UDP {
+		if meta.Option.Has(mux.OptionData) {
+			buf.Copy(mux.NewPacketReader(r), buf.Discard)
+		}
+		return newError("UDP is not supported")
+	}
+	// Read optiondata
+	var optiondata buf.MultiBuffer
+	if meta.Option.Has(mux.OptionData) {
+		rr := mux.NewStreamReader(r)
+		// Read all
+		for {
+			mb, err := rr.ReadMultiBuffer()
+			if err == io.EOF { break }
+			if err != nil {
+				buf.Copy(rr, buf.Discard)
+				// inform portal the connection is failed
+				closing := mux.FrameMetadata {
+					SessionStatus: mux.SessionStatusEnd,
+					SessionID:     meta.SessionID,
+				}
+				if err := writeFrame(w, &closing); err != nil {
+					return newError("failed to write error").AtWarning().Base(err)
+				}
+				return newError("failed copy OptionData.").Base(err)
+			}
+			optiondata = append(optiondata, mb...)
+		}
+	}
+	go b.handleNewRequest(ctx, ctxmsg, meta, optiondata, w)
+	return nil
+}
 
+func (b *Bridge) handleNewRequest(ctx, ctxmsg context.Context, meta *mux.FrameMetadata, optiondata buf.MultiBuffer, w buf.Writer) {
 	type linkOut struct {
 		*transport.Link
 		err error
@@ -185,59 +221,53 @@ func (b *Bridge) handleStatusNew(ctx context.Context, meta *mux.FrameMetadata, r
 	portalLink := <- portalChan
 	targetLink := <- targetChan
 	if portalLink.err != nil {
-		common.Close(targetLink.Link)
-		if meta.Option.Has(mux.OptionData) {
-			buf.Copy(mux.NewStreamReader(r), buf.Discard)
-		}
+		common.Close(targetLink.Link.Writer)
+		common.Close(targetLink.Link.Reader)
 		// inform portal the connection is failed
-		closing := buf.New()
-		mux.FrameMetadata{
+		closing := mux.FrameMetadata {
 			SessionStatus: mux.SessionStatusEnd,
 			SessionID:     meta.SessionID,
-		}.WriteTo(closing)
-		if err := w.WriteMultiBuffer(buf.MultiBuffer{closing}); err != nil {
-			return newError("failed to write error").AtWarning().Base(err)
 		}
-		return newError("failed to connect to portal.").Base(portalLink.err)
+		if err := writeFrame(w, &closing); err != nil {
+			common.Interrupt(w)
+			newError("failed to write error").Base(err).WriteToLog(session.ExportIDToError(ctx))
+		}
+		newError("failed to connect to portal.").Base(portalLink.err).WriteToLog(session.ExportIDToError(ctx))
 	}
 	if targetLink.err != nil {
-		common.Close(portalLink.Link)
-		if meta.Option.Has(mux.OptionData) {
-			buf.Copy(mux.NewStreamReader(r), buf.Discard)
-		}
-		return newError("failed to dispatch request.").Base(targetLink.err)
-	}
-	// Copy optiondata
-	if meta.Option.Has(mux.OptionData) {
-		var rr buf.Reader
-		if meta.Target.Network == net.Network_UDP {
-			rr = mux.NewPacketReader(r)
-		} else {
-			rr = mux.NewStreamReader(r)
-		}
-		if err := buf.Copy(rr, targetLink.Writer); err != nil {
-			buf.Copy(rr, buf.Discard)
-			common.Close(targetLink.Link)
-			common.Interrupt(portalLink.Link)
-			return newError("failed copy OptionData.").Base(err)
-		}
+		common.Close(portalLink.Link.Reader)
+		common.Close(portalLink.Link.Writer)
+		newError("failed to dispatch request.").Base(targetLink.err).WriteToLog(session.ExportIDToError(ctx))
 	}
 	// Copy
 	t2pFunc := func() error {
 		return buf.Copy(targetLink.Reader, portalLink.Writer)
 	}
 	p2tFunc := func() error {
+		if err := targetLink.Writer.WriteMultiBuffer(optiondata); err != nil {
+			return err
+		}
+		optiondata = nil
 		return buf.Copy(portalLink.Reader, targetLink.Writer)
 	}
 	t2pDonePost := task.OnSuccess(t2pFunc, task.Close(portalLink.Writer))
 	p2tDonePost := task.OnSuccess(p2tFunc, task.Close(targetLink.Writer))
-	go func() {
-		err := task.Run(ctx, t2pDonePost, p2tDonePost)
-		if err != nil {
-			common.Interrupt(portalLink.Writer)
-			common.Interrupt(targetLink.Writer)
-			newError("connection closed").Base(err).WriteToLog(session.ExportIDToError(ctx))
-		}
-	}()
+	err := task.Run(ctx, t2pDonePost, p2tDonePost)
+	if err != nil {
+		common.Interrupt(portalLink.Writer)
+		common.Interrupt(targetLink.Writer)
+		newError("connection closed").Base(err).WriteToLog(session.ExportIDToError(ctx))
+	}
+}
+
+func writeFrame(w buf.Writer, f *mux.FrameMetadata) error {
+	buffer := buf.New()
+	if err := f.WriteTo(buffer); err != nil {
+		buffer.Release()
+		return err
+	}
+	if err := w.WriteMultiBuffer(buf.MultiBuffer{buffer}); err != nil {
+		return err
+	}
 	return nil
 }
