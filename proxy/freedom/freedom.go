@@ -156,7 +156,9 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 		if err := buf.Copy(input, writer, buf.UpdateActivity(timer)); err != nil {
 			return newError("failed to process request").Base(err)
 		}
-
+		if tcpconn, ok := conn.(*net.TCPConn); ok {
+			return tcpconn.CloseWrite()
+		}
 		return nil
 	}
 

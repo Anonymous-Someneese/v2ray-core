@@ -120,7 +120,13 @@ func (c *Client) Process(ctx context.Context, link *transport.Link, dialer inter
 
 	requestFunc := func() error {
 		defer timer.SetTimeout(p.Timeouts.DownlinkOnly)
-		return buf.Copy(link.Reader, buf.NewWriter(conn), buf.UpdateActivity(timer))
+		if err := buf.Copy(link.Reader, buf.NewWriter(conn), buf.UpdateActivity(timer)); err != nil {
+			return err
+		}
+		if tcpconn, ok := conn.(*net.TCPConn); ok {
+			return tcpconn.CloseWrite()
+		}
+		return nil
 	}
 	responseFunc := func() error {
 		defer timer.SetTimeout(p.Timeouts.UplinkOnly)

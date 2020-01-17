@@ -199,7 +199,9 @@ func (s *Server) handleConnect(ctx context.Context, request *http.Request, reade
 		if err := buf.Copy(link.Reader, v2writer, buf.UpdateActivity(timer)); err != nil {
 			return err
 		}
-
+		if tcpconn, ok := conn.(*net.TCPConn); ok {
+			return tcpconn.CloseWrite()
+		}
 		return nil
 	}
 
