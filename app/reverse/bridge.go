@@ -158,16 +158,21 @@ func (b *Bridge) handleStatusNew(ctx context.Context, meta *mux.FrameMetadata, r
 	}
 	ctxmsg := log.ContextWithAccessMessage(ctx, msg)
 	
-	if meta.Target.Network == net.Network_UDP {
+	if meta.Target.Network == net.Network_Unknown {
 		if meta.Option.Has(mux.OptionData) {
 			buf.Copy(mux.NewPacketReader(r), buf.Discard)
 		}
-		return newError("UDP is not supported")
+		return newError("Network is unknown")
 	}
 	// Read optiondata
 	var optiondata buf.MultiBuffer
 	if meta.Option.Has(mux.OptionData) {
-		rr := mux.NewStreamReader(r)
+		var rr buf.Reader
+		if meta.Target.Network == net.Network_TCP {
+			rr = mux.NewStreamReader(r)
+		} else {
+			rr = mux.NewPacketReader(r)
+		}
 		// Read all
 		for {
 			mb, err := rr.ReadMultiBuffer()
@@ -207,7 +212,7 @@ func (b *Bridge) handleNewRequest(ctx, ctxmsg context.Context, meta *mux.FrameMe
 			return
 		}
 		link, err := b.dispatcher.Dispatch(ctx, net.Destination{
-			Network: net.Network_TCP,
+			Network: meta.Target.Network,
 			Address: net.DomainAddress(b.domain),
 			Port:    net.Port(meta.SessionID),
 		})
