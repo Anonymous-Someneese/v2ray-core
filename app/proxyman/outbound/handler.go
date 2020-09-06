@@ -2,6 +2,7 @@ package outbound
 
 import (
 	"context"
+	"time"
 
 	"v2ray.com/core"
 	"v2ray.com/core/app/proxyman"
@@ -114,6 +115,8 @@ func NewHandler(ctx context.Context, config *core.OutboundHandlerConfig) (outbou
 					Strategy: mux.ClientStrategy{
 						MaxConcurrency: config.Concurrency,
 						MaxConnection:  128,
+						IdleTimeout:    300 * time.Second,
+						SendHeartbeat:  true,
 					},
 				},
 			},

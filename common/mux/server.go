@@ -73,9 +73,13 @@ type ServerWorker struct {
 }
 
 func NewServerWorker(ctx context.Context, d routing.Dispatcher, link *transport.Link) (*ServerWorker, error) {
+	aw := NewAtomicWriter(link.Writer)
 	worker := &ServerWorker{
 		dispatcher:     d,
-		link:           link,
+		link:           &transport.Link{
+			Reader: link.Reader,
+			Writer: aw,
+		},
 		sessionManager: NewSessionManager(),
 	}
 	go worker.run(ctx)
