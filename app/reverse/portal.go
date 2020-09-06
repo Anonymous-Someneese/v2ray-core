@@ -64,6 +64,7 @@ func (p *Portal) HandleConnection(ctx context.Context, link *transport.Link) err
 	if isDomain(outboundMeta.Target, p.domain) {
 		// control connection
 		if outboundMeta.Target.Port == net.Port(1) {
+			newError("control link established").AtDebug().WriteToLog(session.ExportIDToError(ctx))
 			p.control.link = link
 			return p.control.run(ctx)
 		}
@@ -71,6 +72,9 @@ func (p *Portal) HandleConnection(ctx context.Context, link *transport.Link) err
 		return p.control.handleDataConn(ctx, link, outboundMeta.Target.Port.Value())
 	}
 	// new request via control
+	if p.control.link == nil {
+		return newError("control link is not established").AtInfo()
+	}
 	return p.control.Dispatch(ctx, link)
 }
 
