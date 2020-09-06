@@ -70,9 +70,7 @@ func (r *Reverse) Type() interface{} {
 
 func (r *Reverse) Start() error {
 	for _, b := range r.bridges {
-		if err := b.Start(); err != nil {
-			return err
-		}
+		b.Start()
 	}
 
 	for _, p := range r.portals {
@@ -87,7 +85,7 @@ func (r *Reverse) Start() error {
 func (r *Reverse) Close() error {
 	var errs []error
 	for _, b := range r.bridges {
-		errs = append(errs, b.Close())
+		b.Close()
 	}
 
 	for _, p := range r.portals {
