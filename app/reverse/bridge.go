@@ -4,8 +4,8 @@ package reverse
 
 import (
 	"context"
-	"time"
 	"io"
+	"time"
 
 	"v2ray.com/core/common"
 	"v2ray.com/core/common/buf"
@@ -21,10 +21,10 @@ import (
 
 // Bridge is a component in reverse proxy, that relays connections from Portal to local address.
 type Bridge struct {
-	dispatcher  routing.Dispatcher
-	tag         string
-	domain      string
-	cancel      context.CancelFunc
+	dispatcher routing.Dispatcher
+	tag        string
+	domain     string
+	cancel     context.CancelFunc
 }
 
 // NewBridge creates a new Bridge instance.
@@ -85,6 +85,8 @@ func (b *Bridge) handleLink(ctx context.Context, link *transport.Link) error {
 	defer keepalive.Release()
 	meta := mux.FrameMetadata{SessionStatus: mux.SessionStatusKeepAlive}
 	common.Must(meta.WriteTo(&keepalive))
+	newError("establish control link").AtDebug().WriteToLog(session.ExportIDToError(ctx))
+	link.Writer.WriteMultiBuffer(buf.MultiBuffer{&keepalive})
 
 	reader := &buf.BufferedReader{Reader: link.Reader}
 	var err error
@@ -94,7 +96,7 @@ func (b *Bridge) handleLink(ctx context.Context, link *transport.Link) error {
 			common.Close(link.Writer)
 			common.Close(reader)
 			return context.Canceled
-		case <- timer.C:
+		case <-timer.C:
 			err = link.Writer.WriteMultiBuffer(buf.MultiBuffer{&keepalive})
 			break
 		default:
@@ -157,7 +159,7 @@ func (b *Bridge) handleStatusNew(ctx context.Context, meta *mux.FrameMetadata, r
 		msg.Email = inbound.User.Email
 	}
 	ctxmsg := log.ContextWithAccessMessage(ctx, msg)
-	
+
 	if meta.Target.Network == net.Network_Unknown {
 		if meta.Option.Has(mux.OptionData) {
 			buf.Copy(mux.NewPacketReader(r), buf.Discard)
@@ -176,11 +178,13 @@ func (b *Bridge) handleStatusNew(ctx context.Context, meta *mux.FrameMetadata, r
 		// Read all
 		for {
 			mb, err := rr.ReadMultiBuffer()
-			if err == io.EOF { break }
+			if err == io.EOF {
+				break
+			}
 			if err != nil {
 				buf.Copy(rr, buf.Discard)
 				// inform portal the connection is failed
-				closing := mux.FrameMetadata {
+				closing := mux.FrameMetadata{
 					SessionStatus: mux.SessionStatusEnd,
 					SessionID:     meta.SessionID,
 				}
@@ -223,13 +227,13 @@ func (b *Bridge) handleNewRequest(ctx, ctxmsg context.Context, meta *mux.FrameMe
 		link, err := b.dispatcher.Dispatch(ctxmsg, meta.Target)
 		targetChan <- linkOut{Link: link, err: err}
 	}()
-	portalLink := <- portalChan
-	targetLink := <- targetChan
+	portalLink := <-portalChan
+	targetLink := <-targetChan
 	if portalLink.err != nil {
 		common.Close(targetLink.Link.Writer)
 		common.Close(targetLink.Link.Reader)
 		// inform portal the connection is failed
-		closing := mux.FrameMetadata {
+		closing := mux.FrameMetadata{
 			SessionStatus: mux.SessionStatusEnd,
 			SessionID:     meta.SessionID,
 		}
