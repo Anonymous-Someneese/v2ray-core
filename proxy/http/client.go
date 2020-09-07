@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"sync"
+	"time"
 
 	"golang.org/x/net/http2"
 
@@ -81,7 +82,11 @@ func (c *Client) Process(ctx context.Context, link *transport.Link, dialer inter
 	var user *protocol.MemoryUser
 	var conn internet.Connection
 
-	mbuf, _ := link.Reader.ReadMultiBuffer()
+	r, ok := link.Reader.(buf.TimeoutReader)
+	if !ok {
+		return newError("not a timeout Reader")
+	}
+	mbuf, _ := r.ReadMultiBufferTimeout(20 * time.Millisecond)
 	len := mbuf.Len()
 	firstPayload := bytespool.Alloc(len)
 	mbuf, _ = buf.SplitBytes(mbuf, firstPayload)

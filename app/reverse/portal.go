@@ -109,6 +109,7 @@ type pendingLink struct {
 
 type control struct {
 	link    *transport.Link
+	linkMtx sync.Mutex
 	pending [65535]*pendingLink
 	mutex   sync.RWMutex
 }
@@ -135,6 +136,8 @@ func (c *control) Dispatch(ctx context.Context, link *transport.Link) error {
 		c.replacePending(id, nil)
 		return err
 	}
+	c.linkMtx.Lock()
+	defer c.linkMtx.Unlock()
 	if err := w.WriteMultiBuffer(mb); err != nil {
 		c.replacePending(id, nil)
 		return err

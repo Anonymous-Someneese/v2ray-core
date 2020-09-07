@@ -201,37 +201,19 @@ func (b *Bridge) handleStatusNew(ctx context.Context, meta *mux.FrameMetadata, r
 }
 
 func (b *Bridge) handleNewRequest(ctx, ctxmsg context.Context, meta *mux.FrameMetadata, optiondata buf.MultiBuffer, w buf.Writer) {
-	type linkOut struct {
-		*transport.Link
-		err error
-	}
-	portalChan := make(chan linkOut)
-	defer close(portalChan)
-	targetChan := make(chan linkOut)
-	defer close(targetChan)
+	var portalLink *transport.Link
+	var targetLink *transport.Link
+	var err error
 	// connect to portal
-	go func() {
-		if meta.SessionID < 2 {
-			portalChan <- linkOut{Link: nil, err: newError("invalid session id")}
-			return
-		}
-		link, err := b.dispatcher.Dispatch(ctx, net.Destination{
-			Network: meta.Target.Network,
-			Address: net.DomainAddress(b.domain),
-			Port:    net.Port(meta.SessionID),
-		})
-		portalChan <- linkOut{Link: link, err: err}
-	}()
-	// connect to target
-	go func() {
-		link, err := b.dispatcher.Dispatch(ctxmsg, meta.Target)
-		targetChan <- linkOut{Link: link, err: err}
-	}()
-	portalLink := <-portalChan
-	targetLink := <-targetChan
-	if portalLink.err != nil {
-		common.Close(targetLink.Link.Writer)
-		common.Close(targetLink.Link.Reader)
+	if meta.SessionID < 2 {
+		err = newError("invalid session id")
+	}
+	portalLink, err = b.dispatcher.Dispatch(ctx, net.Destination{
+		Network: meta.Target.Network,
+		Address: net.DomainAddress(b.domain),
+		Port:    net.Port(meta.SessionID),
+	})
+	if err != nil {
 		// inform portal the connection is failed
 		closing := mux.FrameMetadata{
 			SessionStatus: mux.SessionStatusEnd,
@@ -241,18 +223,21 @@ func (b *Bridge) handleNewRequest(ctx, ctxmsg context.Context, meta *mux.FrameMe
 			common.Interrupt(w)
 			newError("failed to write error").Base(err).WriteToLog(session.ExportIDToError(ctx))
 		}
-		newError("failed to connect to portal.").Base(portalLink.err).WriteToLog(session.ExportIDToError(ctx))
+		newError("failed to connect to portal.").Base(err).WriteToLog(session.ExportIDToError(ctx))
 	}
-	if targetLink.err != nil {
-		common.Close(portalLink.Link.Reader)
-		common.Close(portalLink.Link.Writer)
-		newError("failed to dispatch request.").Base(targetLink.err).WriteToLog(session.ExportIDToError(ctx))
+	// connect to target
+	targetLink, err = b.dispatcher.Dispatch(ctxmsg, meta.Target)
+	if err != nil {
+		common.Close(portalLink.Reader)
+		common.Close(portalLink.Writer)
+		newError("failed to dispatch request.").Base(err).WriteToLog(session.ExportIDToError(ctx))
 	}
 	// Copy
 	t2pFunc := func() error {
 		return buf.Copy(targetLink.Reader, portalLink.Writer)
 	}
 	p2tFunc := func() error {
+		newError("writting {} bytes to target", optiondata.Len()).AtDebug().WriteToLog(session.ExportIDToError(ctx))
 		if err := targetLink.Writer.WriteMultiBuffer(optiondata); err != nil {
 			return err
 		}
@@ -261,7 +246,7 @@ func (b *Bridge) handleNewRequest(ctx, ctxmsg context.Context, meta *mux.FrameMe
 	}
 	t2pDonePost := task.OnSuccess(t2pFunc, task.Close(portalLink.Writer))
 	p2tDonePost := task.OnSuccess(p2tFunc, task.Close(targetLink.Writer))
-	err := task.Run(ctx, t2pDonePost, p2tDonePost)
+	err = task.Run(ctx, t2pDonePost, p2tDonePost)
 	if err != nil {
 		common.Interrupt(portalLink.Writer)
 		common.Interrupt(targetLink.Writer)
