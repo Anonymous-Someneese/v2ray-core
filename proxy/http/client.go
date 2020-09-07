@@ -121,7 +121,11 @@ func (c *Client) Process(ctx context.Context, link *transport.Link, dialer inter
 	}
 
 	ctx, cancel := context.WithCancel(ctx)
-	timer := signal.CancelAfterInactivity(ctx, cancel, p.Timeouts.ConnectionIdle)
+	mcancel := func() {
+		newError("timeout").AtDebug().WriteToLog(session.ExportIDToError(ctx))
+		cancel()
+	}
+	timer := signal.CancelAfterInactivity(ctx, mcancel, p.Timeouts.ConnectionIdle)
 
 	requestFunc := func() error {
 		defer timer.SetTimeout(p.Timeouts.DownlinkOnly)

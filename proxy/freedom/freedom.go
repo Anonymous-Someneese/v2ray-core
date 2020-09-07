@@ -141,7 +141,11 @@ func (h *Handler) Process(ctx context.Context, link *transport.Link, dialer inte
 
 	plcy := h.policy()
 	ctx, cancel := context.WithCancel(ctx)
-	timer := signal.CancelAfterInactivity(ctx, cancel, plcy.Timeouts.ConnectionIdle)
+	mcancel := func() {
+		newError("timeout").AtDebug().WriteToLog(session.ExportIDToError(ctx))
+		cancel()
+	}
+	timer := signal.CancelAfterInactivity(ctx, mcancel, plcy.Timeouts.ConnectionIdle)
 
 	requestDone := func() error {
 		defer timer.SetTimeout(plcy.Timeouts.DownlinkOnly)

@@ -246,7 +246,7 @@ func (b *Bridge) handleNewRequest(ctx, ctxmsg context.Context, meta *mux.FrameMe
 	}
 	t2pDonePost := task.OnSuccess(t2pFunc, task.Close(portalLink.Writer))
 	p2tDonePost := task.OnSuccess(p2tFunc, task.Close(targetLink.Writer))
-	err = task.Run(ctx, t2pDonePost, p2tDonePost)
+	err = task.Run(ctxmsg, t2pDonePost, p2tDonePost)
 	if err != nil {
 		common.Interrupt(portalLink.Writer)
 		common.Interrupt(targetLink.Writer)
