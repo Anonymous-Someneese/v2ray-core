@@ -40,10 +40,28 @@ type h2Conn struct {
 	h2Conn  *http2.ClientConn
 }
 
-var (
-	cachedH2Mutex sync.Mutex
-	cachedH2Conns map[net.Destination]h2Conn
-)
+type h2ConnCache struct {
+	mutex 	sync.RWMutex
+	conns 	map[net.Destination]h2Conn
+}
+
+func (c *h2ConnCache) Find(dest net.Destination) (h2Conn, bool) {
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
+	cachedConn, found := c.conns[dest]
+	return cachedConn, found
+}
+
+func (c *h2ConnCache) Set(dest net.Destination, conn h2Conn) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
+	if c.conns == nil {
+		c.conns = make(map[net.Destination]h2Conn)
+	}
+	c.conns[dest] = conn
+}
+
+var h2Conns h2ConnCache
 
 // NewClient create a new http client based on the given config.
 func NewClient(ctx context.Context, config *ClientConfig) (*Client, error) {
@@ -224,10 +242,7 @@ func setUpHTTPTunnel(ctx context.Context, dest net.Destination, target string, u
 		return newHTTP2Conn(rawConn, pw, resp.Body), nil
 	}
 
-	cachedH2Mutex.Lock()
-	defer cachedH2Mutex.Unlock()
-
-	if cachedConn, found := cachedH2Conns[dest]; found {
+	if cachedConn, found := h2Conns.Find(dest); found {
 		rc, cc := cachedConn.rawConn, cachedConn.h2Conn
 		if cc.CanTakeNewRequest() {
 			proxyConn, err := connectHTTP2(rc, cc)
@@ -275,20 +290,18 @@ func setUpHTTPTunnel(ctx context.Context, dest net.Destination, target string, u
 			return nil, err
 		}
 
-		if cachedH2Conns == nil {
-			cachedH2Conns = make(map[net.Destination]h2Conn)
-		}
-
-		cachedH2Conns[dest] = h2Conn{
+		h2Conns.Set(dest, h2Conn{
 			rawConn: rawConn,
 			h2Conn:  h2clientConn,
-		}
+		})
 
 		return proxyConn, err
 	default:
 		return nil, newError("negotiated unsupported application layer protocol: " + nextProto)
 	}
 }
+
+
 
 func newHTTP2Conn(c net.Conn, pipedReqBody *io.PipeWriter, respBody io.ReadCloser) net.Conn {
 	return &http2Conn{Conn: c, in: pipedReqBody, out: respBody}
